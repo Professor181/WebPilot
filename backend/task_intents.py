@@ -175,7 +175,7 @@ def variant_step(intents: Dict[str, Any], elements: List[Dict[str, Any]], phases
     variant = intents.get("variant")
     if not variant or "variant" in phases:
         return None
-    hits = find_variant_elements(variant, elements)
+    hits = [(e, o) for e, o in find_variant_elements(variant, elements) if not e.get("is_destructive_action")]
     usable = [(e, o) for e, o in hits if variant_available(e, o)]
     if not usable:
         return None
@@ -320,6 +320,7 @@ def clean_query(query: Optional[str]) -> Optional[str]:
     q = re.sub(rf"\bfrom\s+{DATE_TOKEN}.*$", " ", q, flags=re.I)
     q = re.sub(r"\b(?:for|with)\s+\d{1,2}\s*(?:adults?|guests?|people|persons|pax|travell?ers|children|kids)\b.*$", " ", q, flags=re.I)
     q = re.sub(r"\s+and\s+show\s+me\b.*$|\s+(?:and\s+)?show\s+(?:me|them)\b.*$", " ", q, flags=re.I)
+    q = re.sub(r"^\s*(?:the\s+)?(?:top|best|first)\s+\d{1,2}\s+", "", q, flags=re.I)  # "top 5 headphones"
     stripped = re.sub(r"^\s*(?:some|a few|the|good|nice|great|top|best|cheap)\s+(?:(?:some|good|nice|great|top|best|cheap)\s+)*", "", q, flags=re.I)
     q = stripped if stripped.strip() else q
     q = re.sub(r"\s+", " ", q).strip(" ,.-")

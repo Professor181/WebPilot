@@ -136,7 +136,7 @@ _MULTISTEP_RE = re.compile(
     r"sign up|fill (?:in|out))\b")
 _ON_WEB_RE = re.compile(r"\b(on|across) the (web|internet)\b|\bonline\b|\bweb search\b")
 _SANDBOX_RULE_SCENARIOS = {"attendance_audit", "profile_comparison", "laptop_shopping", "grant_form"}
-_BRAND_ACTION_RE = re.compile(r"\b(open|visit|launch|ask|go to|navigate|search|look up|find|type|click|browse|buy|add|"
+_BRAND_ACTION_RE = re.compile(r"\b(open|visit|launch|ask|go to|navigate|search|look up|look for|check for|shop for|pick|find|type|click|browse|buy|add|"
                               r"check ?out|book|order|write|post|show|tell|summari[sz]e|read|get)\b")
 _LOGIN_SIGNAL_RE = re.compile(r"login|log in|captcha|otp|sign|portal|erp")
 
@@ -2086,32 +2086,85 @@ class PlannerEngine:
             await ap.highlight(page, el["idx"], f"WebPilot Step #{k}: {action.replace('_', ' ').title()}")
             shot = await ap.screenshot(page, run.task_id, f"step_{k}")
             await ap.unhighlight(page)
-            loc = ap.locator_for(page, el["idx"])
-            if action in ("FILL_AND_SUBMIT", "FILL"):
-                if el.get("contenteditable") and el.get("tag") not in ("input", "textarea"):
-                    await loc.click(timeout=8000)
-                    await page.keyboard.type(decision.get("text", ""), delay=8)  # rich editors ignore fill()
-                else:
-                    await loc.fill(decision.get("text", ""))
-                if action == "FILL_AND_SUBMIT":
-                    await loc.press("Enter")
-                    await ap.settle(page)
-                    if await ap.signature(page) == before:
-                        await page.evaluate(_SUBMIT_FALLBACK_JS, el["idx"])
+            async def perform(idx: int) -> None:
+                loc = ap.locator_for(page, idx)
+                if action in ("FILL_AND_SUBMIT", "FILL"):
+                    if el.get("contenteditable") and el.get("tag") not in ("input", "textarea"):
+                        await loc.click(timeout=8000)
+                        await page.keyboard.type(decision.get("text", ""), delay=8)  # rich editors ignore fill()
+                    else:
+                        await loc.fill(decision.get("text", ""), timeout=8000)
+                    if action == "FILL_AND_SUBMIT":
+                        await loc.press("Enter", timeout=8000)
                         await ap.settle(page)
-            elif action == "SELECT":
+                        if await ap.signature(page) == before:
+                            await page.evaluate(_SUBMIT_FALLBACK_JS, idx)
+                            await ap.settle(page)
+                elif action == "SELECT":
+                    try:
+                        await loc.select_option(label=decision.get("text", ""), timeout=8000)
+                    except Exception:
+                        await loc.select_option(value=decision.get("text", ""), timeout=8000)
+                    await ap.settle(page)
+                else:
+                    try:
+                        await page.evaluate("i => document.querySelector(`[data-webpilot-idx=\"${i}\"]`)?.removeAttribute('target')", idx)
+                    except Exception:
+                        pass
+                    try:
+                        await loc.click(timeout=6000)
+                    except Exception:
+                        # Animated widgets (calendars, carousels) never look "stable" to Playwright: click anyway.
+                        try:
+                            await loc.click(force=True, timeout=4000)
+                        except Exception:
+                            if not await page.evaluate(
+                                    "i => { const e = document.querySelector(`[data-webpilot-idx=\"${i}\"]`); if (!e) return false;"
+                                    " e.click(); return true; }", idx):
+                                raise
+                    await ap.settle(page)
+
+            async def by_label() -> bool:
+                """Re-rendered widgets keep their aria-label: click the control by that exact label."""
+                name = (el.get("aria_label") or el.get("accessible_name") or "").strip()
+                if action != "CLICK" or not name or len(name) > 180:
+                    return False
+                target = page.locator(f'[aria-label="{name.replace(chr(92), "").replace(chr(34), chr(92) + chr(34))}"]').first
                 try:
-                    await loc.select_option(label=decision.get("text", ""), timeout=8000)
+                    if await target.count() == 0:
+                        return False
+                    await target.click(force=True, timeout=5000)
+                    await ap.settle(page)
+                    return True
                 except Exception:
-                    await loc.select_option(value=decision.get("text", ""), timeout=8000)
-                await ap.settle(page)
-            else:
+                    return False
+
+            try:
+                if action == "CLICK" and await ap.locator_for(page, el["idx"]).count() == 0 and await by_label():
+                    pass  # the marked node was replaced by an identical re-render; clicked it by label
+                else:
+                    await perform(el["idx"])
+            except Exception as first_error:
+                # Modern sites re-render (calendars, carousels) and drop our marker: click by exact label, else find the
+                # same control again and retry once. A control that still can't be used fails this step, not the task.
                 try:
-                    await page.evaluate("i => document.querySelector(`[data-webpilot-idx=\"${i}\"]`)?.removeAttribute('target')", el["idx"])
-                except Exception:
-                    pass
-                await loc.click(timeout=12000)
-                await ap.settle(page)
+                    if not await by_label():
+                        same = None
+                        for cand in await ap.index_elements(page):
+                            if cand.get("tag") == el.get("tag") and (cand.get("accessible_name") or "") == (el.get("accessible_name") or "") \
+                                    and (cand.get("text") or "") == (el.get("text") or ""):
+                                same = cand
+                                break
+                        if same is None:
+                            raise first_error
+                        await perform(same["idx"])
+                except Exception as exc:
+                    run.finish(key, StepStatus.FAILED, f"Couldn't use “{label}”: {type(exc).__name__}. Trying another way.")
+                    history.append({"action": action, "phase": f"failed:{decision.get('phase')}", "element_idx": idx,
+                                    "element_label": label, "url_before": url_before, "url_after": page.url, "verified": False})
+                    add_film(k, action, f"{verb} — didn't respond, trying another way", shot, url_before, page.url,
+                             await page.title(), False)
+                    return False
         elif action == "SCROLL_DOWN":
             await page.mouse.wheel(0, 700)
             await asyncio.sleep(0.6)
@@ -2516,9 +2569,15 @@ class PlannerEngine:
         add_film(k, "ASK_HUMAN_APPROVAL", f"Paused before “{label}” — locked price and page state behind the HMAC approval gate",
                  shot, page.url, page.url, title, True, {"element_idx": el["idx"], "approval_id": approval["approval_id"]})
         did = [h for h in data["autopilot"]["filmstrip"] if h["action"] in ("FILL_AND_SUBMIT", "FILL", "SELECT", "CLICK")]
+        picked = (session.memory.get("selected") or {}).get("title") if session is not None else None
+        if picked:  # the item the user chose earlier in the conversation names the action better than page headings
+            params = {**params}  # display only — the hashed parameters stay exactly what the page shows
+            display_item = picked
+        else:
+            display_item = params.get("item_heading")
         summary = ((f"I drove {params['domain']} in a real browser ({len(did)} actions) and stopped at “{label}”" if did else
                     f"I'm ready to click “{label}” on {params['domain']}")
-                   + (f" for “{params['item_heading']}”" if params.get("item_heading") else "")
+                   + (f" for “{display_item}”" if display_item else "")
                    + (f" — total shown {params['currency'] or ''} {params['display_total']:,.2f}" if params.get("display_total") else "")
                    + ". Approve (or just say “yes”) and I'll continue up to the payment page, where you take over.")
         run.save(status=TaskStatus.AWAITING_APPROVAL.value, extracted_data=data, summary=summary,
@@ -2542,8 +2601,9 @@ class PlannerEngine:
         title = await page.title()
         dom = dict(distilled)
         cards = ap.page_cards([e for e in elements if not e.get("disabled")])
-        if len(dom.get("articles") or []) < 3 and cards:
-            dom["articles"] = cards
+        priced_cards = [cd for cd in cards if cd.get("price_amount") is not None]
+        if (len(dom.get("articles") or []) < 3 and cards) or len(priced_cards) >= 3:
+            dom["articles"] = cards  # result cards carry prices, so budgets and price rankings apply
         question_goal = DOMAIN_RE.sub("", run.task["goal"])
         terms = llm_brain.content_tokens(intents["search_query"] or "")
         if terms and not llm_brain.analyse_question(question_goal)["summarize"] and not intents["wants_open_result"]:
@@ -2590,8 +2650,9 @@ class PlannerEngine:
             budget = intents.get("max_price")
             pool = [cd for cd in cards if cd.get("price_amount") is not None and (not budget or cd["price_amount"] <= budget)] or cards
             results = [{"title": cd["title"], "url": cd["url"], "price": cd.get("price"), "screenshot_url": None} for cd in pool[:6]]
+        cart_done = any(h.get("phase") == "cart" and h.get("verified") for h in history)
         if session is not None:
-            if len(results) >= 2:
+            if len(results) >= 2 and not cart_done:  # a cart page's "recommended for you" never replaces the user's options
                 session.memory["results"] = results
             session.memory["page"] = {"url": page.url, "title": title}
             session.touch()
@@ -2599,6 +2660,22 @@ class PlannerEngine:
         first_price = next((p.get("raw") for p in distilled.get("prices") or [] if p.get("raw")), None)
         reply = self._chat_reply(answer, variant, title, results, commit_here, intents, bool(data["autopilot"].get("conversation_id")),
                                  first_price)
+        opened = bool(data["autopilot"]["filmstrip"]) and data["autopilot"]["filmstrip"][0]["description"].startswith("Opened ")
+        if opened and variant is None and not cart_done and bool(data["autopilot"].get("conversation_id")):
+            # "the second one looks good": we opened it, so offer the next step instead of listing the page's links.
+            picked = (session.memory.get("selected") or {}) if session is not None else {}
+            name = (picked.get("title") or re.split(r"\s+[—|-]\s+", title)[0])[:90]
+            price = picked.get("price") or first_price
+            verb = "book it" if re.search(r"stay|villa|home|hotel|room|apartment|flat|cottage|bungalow|rental|night",
+                                          f"{name} {title}", re.I) else "buy it"
+            reply = (f"I've opened “{name}”" + (f" — {price}" if price else "") + f". Shall I {verb}? Say “{verb}” and I'll "
+                     "take it up to the payment page for you to finish.")
+            results = []
+        if cart_done:
+            picked = ((session.memory.get("selected") or {}).get("title") if session is not None else None) or "the item"
+            reply = (f"Done — I added “{picked[:90]}” to your cart ✅ (the site shows “{title[:60]}”). "
+                     "Say “buy it” and I'll take it to checkout, stopping at the payment page for you.")
+            results = []
         data.update({"url": page.url, "title": title, "answer": answer, "firewall_alerts": distilled["firewall_alerts"],
                      "screenshot_url": absolute_url(shot), "render_mode": "live_viewport", "capability_method": "TIER_2_SEMANTIC_DOM:LIVE_AUTOPILOT",
                      "articles": (dom.get("articles") or [])[:20], "prices": (distilled.get("prices") or [])[:20],
@@ -2631,8 +2708,10 @@ class PlannerEngine:
             lines = [f"{n}. {r['title'][:90]}" + (f" — {r['price']}" if r.get("price") else "") for n, r in enumerate(results[:5], start=1)]
             budget = f" under {intents['max_price']:,.0f}" if intents.get("max_price") else ""
             text = f"Here are the best matches{budget} I found on “{title[:60]}”:\n" + "\n".join(lines)
-            if conversational:
-                text += "\nTell me which one you like — e.g. “open the first one”, “is the second one available in size 9?” or “book the third one”."
+            if conversational and intents.get("defer_choice"):
+                text += "\nWhich one would you like me to buy? Say e.g. “the second one” or “is the first one available in size 9?”."
+            elif conversational:
+                text += "\nTell me which one you like — e.g. “the first one looks good”, “open the second one” or “book the third one”."
             return text
         text = re.sub(r"\s*\[#\d+\]", "", answer.get("answer") or "").strip()
         if conversational and commit_here and not intents.get("wants_checkout"):
@@ -2679,6 +2758,7 @@ class PlannerEngine:
                     continue
                 return "needs_details"
             nxt = next((e for e in elements if not e.get("disabled") and e.get("consequence_tier") != "final_payment"
+                        and not e.get("is_destructive_action")
                         and (e.get("tag") in ("button", "a") or e.get("role") == "button" or e.get("input_type") == "submit")
                         and e.get("landmark") not in ("nav", "footer", "header") and self._CONTINUE_RE.search(element_label(e))), None)
             if nxt is None:

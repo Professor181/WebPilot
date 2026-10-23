@@ -90,7 +90,7 @@ def infer_site(goal: str) -> Optional[Tuple[str, str]]:
     best: Optional[Tuple[int, str, str]] = None
     for name, url in directory().items():
         pattern = _name_re(name)
-        cued = re.search(rf"\b{_CUE}\s+(?:the\s+)?{pattern}", text, re.I)
+        cued = re.search(rf"\b{_CUE}\s+(?:the\s+|my\s+|our\s+)?{pattern}", text, re.I)
         leading = re.match(rf"\s*(?:alexa[,\s]+)?{pattern}\s*[:,\-–]", text, re.I)
         hit = cued or leading
         if hit and (best is None or hit.start() < best[0] or (hit.start() == best[0] and len(name) > len(best[1]))):

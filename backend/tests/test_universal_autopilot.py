@@ -105,6 +105,39 @@ def test_semantic_policy_walks_an_unseen_site():
     assert d4["action"] == "ASK_HUMAN_APPROVAL" and d4["element_idx"] == 7  # commit tier preferred over final payment
 
 
+def test_ecommerce_actions_outrank_destructive_and_unrelated_controls():
+    controls = [
+        {"idx": 1, "tag": "button", "accessible_name": "Delete", "bounding_box": {"y": 10}},
+        {"idx": 2, "tag": "button", "text": "Remove", "bounding_box": {"y": 20}},
+        {"idx": 3, "tag": "button", "aria_label": "Sign Out", "bounding_box": {"y": 30}},
+        {"idx": 4, "tag": "button", "accessible_name": "Clear", "bounding_box": {"y": 40}},
+        {"idx": 5, "tag": "button", "accessible_name": "Cancel", "bounding_box": {"y": 50}},
+        {"idx": 6, "tag": "button", "accessible_name": "Put in my tote", "bounding_box": {"y": 100}},
+        {"idx": 7, "tag": "input", "input_type": "submit", "value": "Add to Cart",
+         "accessible_name": "Product option", "bounding_box": {"y": 400}},
+    ]
+    cart = semantic_decide("Add this product to my cart", "https://shop.test/product", "Product", [], controls, "")
+    assert cart["action"] == "CLICK" and cart["element_idx"] == 7
+
+    checkout = semantic_decide(
+        "Buy this item now", "https://shop.test/checkout", "Checkout", [],
+        [{"idx": 1, "tag": "button", "accessible_name": "Submit"},
+         {"idx": 2, "tag": "button", "accessible_name": "Order control", "aria_label": "Place Order"}], "")
+    assert checkout["action"] == "ASK_HUMAN_APPROVAL" and checkout["element_idx"] == 2
+
+    search = semantic_decide(
+        "Search for hiking backpack", "https://shop.test/search", "Results",
+        [{"action": "FILL_AND_SUBMIT", "phase": "search", "url_after": "https://shop.test/search"}],
+        [{"idx": 1, "tag": "a", "accessible_name": "Hiking Backpack", "aria_label": "Delete"},
+         {"idx": 2, "tag": "a", "accessible_name": "Hiking Backpack product"}], "")
+    assert search["action"] == "CLICK" and search["element_idx"] == 2
+
+
+def test_live_dom_indexer_reads_submit_button_value_attribute():
+    assert "el.getAttribute('value')" in live_autopilot.INDEXER_JS
+    assert "aria_label:" in live_autopilot.INDEXER_JS
+
+
 def test_consequence_classifier_and_barriers():
     assert llm_brain.classify_consequence("Place your order") == "final_payment"
     assert llm_brain.classify_consequence("Pay ₹2,499 now") == "final_payment"
@@ -144,6 +177,25 @@ async def test_llm_decisions_are_verified_by_the_semantic_policy(monkeypatch, ll
     assert "<untrusted_web_content" in calls[0]["messages"][1]["content"]
     if expected_by == "semantic_fallback":
         assert "rejected" in out["llm_note"]
+
+
+@pytest.mark.asyncio
+async def test_llm_cannot_select_destructive_control_for_cart_goal(monkeypatch):
+    calls = []
+    proposal = {"action": "CLICK", "element_idx": 1, "text": None, "reason": "remove item"}
+    monkeypatch.setattr(llm_brain, "http_transport", _ollama(proposal, calls))
+    monkeypatch.setattr(llm_brain.brain, "ollama", OllamaProvider())
+    monkeypatch.setenv("WEBPILOT_BRAIN_PROVIDER", "ollama")
+    elements = [
+        {"idx": 1, "tag": "button", "accessible_name": "Delete"},
+        {"idx": 2, "tag": "button", "accessible_name": "Other action", "text": "Add to Cart"},
+    ]
+    out = await decide_next_browser_action("Add this product to my cart", "https://shop.test/product", "Product",
+                                           [], elements, "")
+    prompt = calls[0]["messages"][0]["content"]
+    assert "never select a control labeled Delete" in prompt
+    assert out["action"] == "CLICK" and out["element_idx"] == 2
+    assert out["decided_by"] == "semantic_fallback" and "destructive action ignored" in out["llm_note"]
 
 
 # ============================================================= real Chromium runs

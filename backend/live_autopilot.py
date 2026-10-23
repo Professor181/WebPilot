@@ -6,7 +6,7 @@ WebPilot drives a real Playwright Chromium across multiple pages of ANY website:
   plain web question) is discovered through the configured web search engine (``AUTOPILOT_SEARCH_URL``), the
   only built-in URL. There is no domain lookup table.
 * **Universal DOM indexer** — every step injects one generic scanner that numbers visible, enabled interactive
-  elements (``data-webpilot-idx``) and describes them by tag, input type, ARIA role, accessible name,
+  elements (``data-webpilot-idx``) and describes them by tag, input type, ARIA role, accessible name, input value,
   placeholder, landmark and surrounding card text. No site-specific selectors exist anywhere in this module.
 * **Decisions** — :func:`backend.llm_brain.decide_next_browser_action` (LLM proposes, semantic policy and safety
   rules verify).
@@ -89,7 +89,7 @@ INDEXER_JS = r"""
     for (let k = 0; k < 6 && n.parentElement; k++) {
       n = n.parentElement;
       const t = (n.innerText || '').trim();
-      if (t.length > 700) break;
+      if (t.length > 1600) break;  // big product cards (e.g. marketplace search results) still count
       if (priceRe.test(t)) return t;
       if (!fallback && t.length >= 40) fallback = t;
     }
@@ -125,8 +125,11 @@ INDEXER_JS = r"""
     out.push({
       idx: i, tag: el.tagName.toLowerCase(), input_type: (el.getAttribute('type') || '').toLowerCase(),
       role: (el.getAttribute('role') || '').toLowerCase(), accessible_name: (accName(el) || '').trim().slice(0, 200),
+      aria_label: (el.getAttribute('aria-label') || '').trim().slice(0, 200),
       placeholder: (el.getAttribute('placeholder') || '').slice(0, 120), text: (el.innerText || '').trim().slice(0, 200),
-      value: (el.tagName === 'INPUT' && el.type !== 'password') ? (el.value || '').slice(0, 120) : '',
+      value: (el.tagName === 'INPUT' && el.type !== 'password')
+        ? ((['submit', 'button'].includes((el.getAttribute('type') || '').toLowerCase())
+            ? (el.getAttribute('value') || el.value) : el.value) || '').slice(0, 120) : '',
       name_attr: (el.getAttribute('name') || '').slice(0, 60), href: el.href || '',
       contenteditable: el.isContentEditable || false, landmark: landmark(el), in_search_form: inSearchForm,
       container_text: ctext.slice(0, 300), price_text: pm ? pm[0] : '',
@@ -153,7 +156,8 @@ HIGHLIGHT_JS = r"""
 ([idx, label]) => {
   const el = document.querySelector(`[data-webpilot-idx="${idx}"]`);
   if (!el) return false;
-  el.scrollIntoView({block: 'center', inline: 'nearest'});
+  { const b = el.getBoundingClientRect();  // only scroll when off-screen: scrolling closes popovers on some sites
+    if (b.top < 0 || b.bottom > window.innerHeight || b.left < 0 || b.right > window.innerWidth) el.scrollIntoView({block: 'nearest', inline: 'nearest'}); }
   el.setAttribute('data-webpilot-prev-style', el.getAttribute('style') || '');
   el.style.outline = '3px solid #00CAFF'; el.style.outlineOffset = '2px';
   el.style.boxShadow = '0 0 12px #00CAFF, 0 0 28px rgba(0,202,255,0.55)';
@@ -625,7 +629,7 @@ async def settle(page: Any) -> None:
         await page.wait_for_load_state("networkidle", timeout=3000)
     except Exception:
         pass
-    await asyncio.sleep(0.25)
+    await asyncio.sleep(0.6)  # let slide-in widgets (calendars, menus) finish animating before re-indexing
 
 
 async def index_elements(page: Any) -> List[Dict[str, Any]]:

@@ -222,7 +222,7 @@ def test_booking_form_calendar_stepper_budget_and_reserve_to_payment(mcp, client
     assert "Luxury resort deals" not in t1["summary"]  # sponsored result never offered
 
     t2 = _run(mcp, "the third one looks good", conv)
-    assert t2["summary"].startswith("I've opened “Hilltop Heritage Bungalow Villa” — ₹14,200") and "reserve" in t2["summary"]
+    assert t2["summary"].startswith("I've opened “Hilltop Heritage Bungalow Villa” — ₹14,200") and "Shall I book it?" in t2["summary"]
     t3 = _run(mcp, "book it", conv)
     assert t3["status"] == "AWAITING_APPROVAL" and t3["pending_approval"]["parameters"]["button_text"] == "Reserve"
     final = _execute(mcp, client, t3)
@@ -379,3 +379,62 @@ def test_ask_a_chat_site_types_the_message_waits_for_the_streamed_reply_and_read
     assert "Day 3: a sunset cruise before you fly home." in t["summary"]  # waited for the whole streamed reply
     assert "Hi! What can I help with?" not in t["summary"]  # only the new reply, not the old page text
     client.post("/api/conversations/conv-chat/end", headers=UI)
+
+
+# ============================================================== never delete things the user didn't ask to delete
+
+AMAZON_LIKE_CART = [
+    {"idx": 1, "tag": "input", "input_type": "submit", "value": "Delete", "accessible_name": "Delete Nike Revolution 7 Running Shoes",
+     "bounding_box": {"y": 300}},
+    {"idx": 2, "tag": "input", "input_type": "submit", "value": "Save for later", "accessible_name": "Save for later", "bounding_box": {"y": 300}},
+    {"idx": 3, "tag": "button", "accessible_name": "Remove from cart", "bounding_box": {"y": 320}},
+    {"idx": 4, "tag": "a", "accessible_name": "Sign Out", "landmark": "header", "bounding_box": {"y": 10}},
+    {"idx": 5, "tag": "input", "input_type": "submit", "value": "Proceed to Buy", "accessible_name": "", "bounding_box": {"y": 120}},
+]
+AMAZON_LIKE_RESULTS = [
+    {"idx": 1, "tag": "a", "accessible_name": "Nike Revolution 7 Running Shoes", "href": "https://shop.test/dp/1", "price_text": "₹2,999",
+     "container_text": "Nike Revolution 7 Running Shoes ₹2,999", "landmark": "main", "bounding_box": {"y": 300}},
+    {"idx": 2, "tag": "button", "accessible_name": "Add to cart", "container_text": "Nike Revolution 7 ₹2,999", "bounding_box": {"y": 340}},
+    {"idx": 3, "tag": "a", "accessible_name": "Nike Downshifter 12 Running Shoes", "href": "https://shop.test/dp/2", "price_text": "₹2,499",
+     "container_text": "Nike Downshifter 12 Running Shoes ₹2,499", "landmark": "main", "bounding_box": {"y": 500}},
+    {"idx": 4, "tag": "button", "accessible_name": "Add to cart", "container_text": "Nike Downshifter ₹2,499", "bounding_box": {"y": 540}},
+]
+
+
+def test_shortlist_requests_never_cart_or_buy_and_destructive_controls_are_never_targets():
+    goal = "check for nike running shoes on amazon and pick top 3 for me and ask me which one to buy"
+    intents = parse_goal_intents(goal)
+    assert intents["search_query"] == "nike running shoes" and intents["defer_choice"] is True
+    assert intents["wants_checkout"] is False and intents["wants_cart"] is False
+    on_results = llm_brain.semantic_decide(goal, "https://shop.test/s?k=nike", "Results",
+                                           [{"action": "FILL_AND_SUBMIT", "phase": "search", "url_after": "https://shop.test/s?k=nike"}],
+                                           AMAZON_LIKE_RESULTS, "")
+    assert on_results["action"] == "DONE"  # list the options and ask — no "Add to cart"
+    # "Buy it" on a cart page: approval for Proceed to Buy (read from the input's value), never Delete / Remove.
+    buy = llm_brain.semantic_decide("buy the nike running shoes", "https://shop.test/cart", "Cart", [], AMAZON_LIKE_CART, "")
+    assert buy["action"] == "ASK_HUMAN_APPROVAL" and buy["element_idx"] == 5
+    assert llm_brain.semantic_decide("add nike running shoes to my cart", "https://shop.test/cart", "Cart", [], AMAZON_LIKE_CART,
+                                     "").get("element_idx") not in (1, 3, 4)
+    annotated = {e["idx"]: e for e in llm_brain.annotate_elements(AMAZON_LIKE_CART)}
+    assert annotated[3]["is_cart_action"] is False and annotated[3]["is_destructive_action"] is True  # "Remove from cart"
+    assert llm_brain.destructive_allowed("remove the nike shoes from my cart") is True
+    assert llm_brain.destructive_allowed(goal) is False
+
+
+@pytest.mark.asyncio
+async def test_the_model_cannot_click_delete_for_a_buying_goal(monkeypatch):
+    monkeypatch.setattr(llm_brain, "http_transport", _ollama({"action": "CLICK", "element_idx": 1, "text": None, "reason": "matches the shoes"}))
+    monkeypatch.setattr(llm_brain.brain, "ollama", OllamaProvider())
+    monkeypatch.setenv("WEBPILOT_BRAIN_PROVIDER", "ollama")
+    out = await decide_next_browser_action("buy the nike running shoes", "https://shop.test/cart", "Cart", [], AMAZON_LIKE_CART, "")
+    assert out["element_idx"] == 5 and "destructive action ignored" in out["llm_note"]
+
+
+def test_shortlist_conversation_on_a_store_lists_options_and_asks_which_to_buy(mcp, client):
+    t = _run(mcp, "check for shoes on this store and pick top 3 for me and ask me which one to buy", "conv-shortlist",
+             "/sandbox/strideway")
+    assert t["status"] == "COMPLETED", t["summary"]
+    assert "Which one would you like me to buy?" in t["summary"]
+    assert t["pending_approval"] is None
+    assert client.get("/sandbox/strideway/bag.json").json()["count"] == 0  # nothing added, nothing removed
+    client.post("/api/conversations/conv-shortlist/end", headers=UI)
